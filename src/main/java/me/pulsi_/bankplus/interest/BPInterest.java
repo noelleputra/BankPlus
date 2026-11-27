@@ -4,6 +4,7 @@ import me.pulsi_.bankplus.BankPlus;
 import me.pulsi_.bankplus.bankSystem.Bank;
 import me.pulsi_.bankplus.bankSystem.BankUtils;
 import me.pulsi_.bankplus.managers.BPTaskManager;
+import me.pulsi_.bankplus.utils.BPLogger;
 import me.pulsi_.bankplus.utils.BPUtils;
 import me.pulsi_.bankplus.utils.SavesFile;
 import me.pulsi_.bankplus.values.ConfigValues;
@@ -56,8 +57,16 @@ public class BPInterest {
             OfflineInterestMethod offlineInterestMethod = new OfflineInterestMethod();
 
             for (OfflinePlayer p : Bukkit.getOfflinePlayers()) {
-                if (p.isOnline()) onlineInterestMethod.giveInterest(p);
-                else if (isOfflineInterestEnabled) offlineInterestMethod.giveInterest(p);
+                // Plugin is already marked disabled during onDisable, bail so we don't hold sqlite open.
+                if (!BankPlus.INSTANCE().isEnabled()) return;
+
+                // One broken player shouldn't stop everyone else from getting their interest.
+                try {
+                    if (p.isOnline()) onlineInterestMethod.giveInterest(p);
+                    else if (isOfflineInterestEnabled) offlineInterestMethod.giveInterest(p);
+                } catch (Exception e) {
+                    BPLogger.Console.warn(e, "Could not give interest to " + p.getName() + ".");
+                }
             }
         });
     }
@@ -118,11 +127,12 @@ public class BPInterest {
             for (String line : limiter) {
                 if (!line.contains(":")) continue;
 
+                // Expected format "from-to:rate%", skip the lines that don't follow it instead of throwing.
                 String[] split1 = line.split(":");
-                if (BPUtils.isInvalidNumber(split1[1])) continue;
+                if (split1.length != 2 || BPUtils.isInvalidNumber(split1[1])) continue;
 
                 String[] split2 = split1[0].split("-");
-                if (BPUtils.isInvalidNumber(split2[0]) || BPUtils.isInvalidNumber(split2[1])) continue;
+                if (split2.length != 2 || BPUtils.isInvalidNumber(split2[0]) || BPUtils.isInvalidNumber(split2[1])) continue;
 
                 String interest = split1[1].replace("%", ""), from = split2[0], to = split2[1];
                 BigDecimal interestRate = new BigDecimal(interest), fromNumber = new BigDecimal(from), toNumber = new BigDecimal(to);

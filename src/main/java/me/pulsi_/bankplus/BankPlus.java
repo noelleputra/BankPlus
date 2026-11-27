@@ -12,6 +12,7 @@ import me.pulsi_.bankplus.values.ConfigValues;
 import net.milkbowl.vault.economy.Economy;
 import net.milkbowl.vault.permission.Permission;
 import org.bukkit.Bukkit;
+import org.bukkit.command.CommandExecutor;
 import org.bukkit.plugin.PluginManager;
 import org.bukkit.plugin.RegisteredServiceProvider;
 import org.bukkit.plugin.java.JavaPlugin;
@@ -19,6 +20,7 @@ import org.bukkit.plugin.java.JavaPlugin;
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.net.URI;
+import java.net.URLConnection;
 
 public final class BankPlus extends JavaPlugin {
 
@@ -61,10 +63,11 @@ public final class BankPlus extends JavaPlugin {
                 return;
             }
             BPLogger.Console.log("");
-            BPLogger.Console.log("<red>Cannot load " + BPChat.PREFIX + ", No economy plugin found.");
-            BPLogger.Console.log("<red>Please download an economy plugin to use this plugin.");
+            BPLogger.Console.log("<red>" + BPChat.PREFIX + " didn't find an economy plugin.");
+            BPLogger.Console.log("<red>Vault is installed, but nothing is hooked (EssentialsX, CMI, ...).");
+            BPLogger.Console.log("<red>The plugin will stay loaded. Add an economy plugin and restart.");
             BPLogger.Console.log("");
-            getServer().getPluginManager().disablePlugin(this);
+            replyMissingEconomy();
             return;
         }
 
@@ -115,7 +118,7 @@ public final class BankPlus extends JavaPlugin {
 
     @Override
     public void onDisable() {
-        bpData.shutdownPlugin();
+        if (bpData != null) bpData.shutdownPlugin();
     }
 
     public static BankPlus INSTANCE() {
@@ -174,6 +177,15 @@ public final class BankPlus extends JavaPlugin {
         return bpPlaceholders;
     }
 
+    private void replyMissingEconomy() {
+        CommandExecutor reply = (s, command, label, args) -> {
+            s.sendMessage(BPChat.color(BPChat.PREFIX + " <red>No economy plugin found. Vault is installed, but nothing is hooked. Add EssentialsX, CMI, or another economy plugin and restart."));
+            return true;
+        };
+        getCommand("bankplus").setExecutor(reply);
+        getCommand("banktop").setExecutor(reply);
+    }
+
     private boolean setupEconomy() {
         if (getServer().getPluginManager().getPlugin("Vault") == null) return false;
         RegisteredServiceProvider<Economy> rsp = getServer().getServicesManager().getRegistration(Economy.class);
@@ -185,11 +197,15 @@ public final class BankPlus extends JavaPlugin {
     private boolean isPluginUpdated() {
         String newVersion = getPluginMeta().getVersion();
         boolean updated = true;
-        try (BufferedReader reader = new BufferedReader(new InputStreamReader(
-                URI.create("https://api.spigotmc.org/legacy/update.php?resource=93130").toURL().openConnection().getInputStream()
-        ))) {
-            newVersion = reader.readLine();
-            updated = actualVersion.equals(newVersion);
+        try {
+            URLConnection connection = URI.create("https://api.spigotmc.org/legacy/update.php?resource=93130").toURL().openConnection();
+            connection.setConnectTimeout(5000);
+            connection.setReadTimeout(5000);
+
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(connection.getInputStream()))) {
+                newVersion = reader.readLine();
+                updated = actualVersion.equals(newVersion);
+            }
         } catch (Exception e) {
             BPLogger.Console.warn("Could not check for updates. (No internet connection)");
         }

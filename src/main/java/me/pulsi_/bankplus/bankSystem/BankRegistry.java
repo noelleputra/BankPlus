@@ -2,22 +2,25 @@ package me.pulsi_.bankplus.bankSystem;
 
 import me.pulsi_.bankplus.BankPlus;
 import me.pulsi_.bankplus.account.PlayerRegistry;
+import me.pulsi_.bankplus.utils.BPLogger;
 import me.pulsi_.bankplus.values.ConfigValues;
 import org.bukkit.Bukkit;
 import org.bukkit.entity.Player;
 
 import java.io.File;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
 public class BankRegistry {
 
-    private static final HashMap<String, Bank> banks = new HashMap<>();
+    // Read by async tasks (interest, joins) while a reload can change it on the main thread.
+    private static final Map<String, Bank> banks = new ConcurrentHashMap<>();
 
     public static Bank getBank(String bankName) {
         return banks.get(bankName);
     }
 
-    public static HashMap<String, Bank> getBanks() {
+    public static Map<String, Bank> getBanks() {
         return banks;
     }
 
@@ -47,7 +50,16 @@ public class BankRegistry {
         }
 
         for (File bankFile : bankFiles) {
-            String identifier = bankFile.getName().split("\\.")[0]; // Get the name of the bank from the file.
+            String fileName = bankFile.getName();
+            if (!fileName.endsWith(".yml")) continue;
+
+            String identifier = fileName.substring(0, fileName.length() - 4); // Get the name of the bank from the file.
+
+            // The identifier is also the name of the sql table, anything else would break the queries.
+            if (!identifier.matches("[A-Za-z0-9_]+")) {
+                BPLogger.Console.warn("Skipping the bank file \"" + fileName + "\", bank names can only contain letters, numbers and underscores.");
+                continue;
+            }
             newBanks.add(identifier);
 
             if (banks.containsKey(identifier)) { // If the registered banks already contains the bank, only update it.

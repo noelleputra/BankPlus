@@ -20,6 +20,7 @@ import org.bukkit.entity.Player;
 import java.io.File;
 import java.io.IOException;
 import java.math.BigDecimal;
+import java.math.MathContext;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -60,9 +61,12 @@ public class BPLoanRegistry {
         ConfigurationSection section = saves.getConfigurationSection("loans");
         if (section == null) return;
 
-        for (String receiverUUID : section.getKeys(false)) {
-            ConfigurationSection values = section.getConfigurationSection(receiverUUID);
+        for (String key : section.getKeys(false)) {
+            ConfigurationSection values = section.getConfigurationSection(key);
             if (values == null) continue;
+
+            // A player can have more than one loan, the extra ones are saved as "uuid_2", "uuid_3"...
+            String receiverUUID = key.split("_")[0];
 
             OfflinePlayer receiver, sender = null;
 
@@ -97,17 +101,20 @@ public class BPLoanRegistry {
                 String fromBank = ConfigValues.getMainGuiName(), toBank = ConfigValues.getMainGuiName();
                 String fromBankString = values.getString("from"), toBankString = values.getString("to");
 
-                if (fromBankString == null) BPLogger.Console.warn("The loan \"" + receiverUUID + "\" did not specify a bank to take the money, using the main bank.");
-                else if (!BankUtils.exist(fromBankString)) {
-                    BPLogger.Console.warn("The loan \"" + receiverUUID + "\" specified an invalid bank to take the money, using the main bank.");
-                    fromBank = fromBankString;
+                if (sender == null) {
+                    BPLogger.Console.warn("Could not load \"" + receiverUUID + "\" loan! (No sender and no requested bank specified)");
+                    continue;
                 }
 
+                if (fromBankString == null) BPLogger.Console.warn("The loan \"" + receiverUUID + "\" did not specify a bank to take the money, using the main bank.");
+                else if (!BankUtils.exist(fromBankString))
+                    BPLogger.Console.warn("The loan \"" + receiverUUID + "\" specified an invalid bank to take the money, using the main bank.");
+                else fromBank = fromBankString;
+
                 if (toBankString == null) BPLogger.Console.warn("The loan \"" + receiverUUID + "\" did not specify a bank to give the money, using the main bank.");
-                else if (!BankUtils.exist(toBankString)) {
+                else if (!BankUtils.exist(toBankString))
                     BPLogger.Console.warn("The loan \"" + receiverUUID + "\" specified an invalid bank to give the money, using the main bank.");
-                    toBank = toBankString;
-                }
+                else toBank = toBankString;
 
                 loan = new BPLoan(sender, receiver, BankRegistry.getBank(fromBank), BankRegistry.getBank(toBank));
             }
@@ -115,6 +122,7 @@ public class BPLoanRegistry {
             loan.setMoneyToReturn(new BigDecimal(moneyToReturn));
             loan.setInstalments(values.getInt("instalments"));
             loan.setInstalmentsPoint(values.getInt("instalments-point"));
+            loan.setTimeLeft(values.getLong("time-left")); // Saved as the milliseconds left before the next instalment.
 
             registerLoan(loan);
         }
@@ -126,11 +134,11 @@ public class BPLoanRegistry {
      * Save format:
      * <pre>
      * loans:
-     *   Receiver-UUID:
+     *   Receiver-UUID (or Receiver-UUID_2, _3... if the player has more loans):
      *     money-to-return: The total amount of money to return.
      *     instalments: The number of instalments of this loan.
      *     instalments-point: The current instalment.
-     *     time-left: The time left before the next instalment.
+     *     time-left: The milliseconds left before the next instalment.
      *     from: The name of the bank where to take the money.
      *     to: The name of the bank where to send the money.
      *     requested-bank: Not always present, in case a loan has been requested from a back, this will be the giver bank.
@@ -139,17 +147,25 @@ public class BPLoanRegistry {
     public static void saveAllLoans() {
         File file = SavesFile.getFile();
         FileConfiguration config = SavesFile.getConfig();
-        for (BPLoan loan : loans) {
-            String path = "loans." + loan.getReceiver().getUniqueId() + ".";
 
-            if (loan.getSender() != null) config.set(path + "sender", loan.getSender().getUniqueId());
-            config.set(path + "money-to-return", loan.getMoneyToReturn());
+        // Wipe the old entries first, otherwise loans that are already paid would come back after a restart.
+        config.set("loans", null);
+
+        HashMap<UUID, Integer> perReceiver = new HashMap<>();
+        for (BPLoan loan : loans) {
+            UUID receiver = loan.getReceiver().getUniqueId();
+            int count = perReceiver.merge(receiver, 1, Integer::sum);
+            String path = "loans." + (count == 1 ? receiver : receiver + "_" + count) + ".";
+
+            if (loan.getSender() != null) config.set(path + "sender", loan.getSender().getUniqueId().toString());
+            config.set(path + "money-to-return", loan.getMoneyToReturn().toPlainString());
             config.set(path + "instalments", loan.getInstalments());
             config.set(path + "instalments-point", loan.getInstalmentsPoint());
-            config.set(path + "time-left", loan.getTimeLeft());
-            config.set(path + "from", loan.getSenderBank().getIdentifier());
-            config.set(path + "to", loan.getReceiverBank().getIdentifier());
-            config.set(path + "requested-bank", loan.getRequestedBank().getIdentifier());
+            config.set(path + "time-left", Math.max(0L, loan.getTimeLeft() - System.currentTimeMillis()));
+            // Bank-to-player loans only have the requested bank, player-to-player ones only the two banks.
+            if (loan.getSenderBank() != null) config.set(path + "from", loan.getSenderBank().getIdentifier());
+            if (loan.getReceiverBank() != null) config.set(path + "to", loan.getReceiverBank().getIdentifier());
+            if (loan.getRequestedBank() != null) config.set(path + "requested-bank", loan.getRequestedBank().getIdentifier());
         }
 
         try {
@@ -170,6 +186,7 @@ public class BPLoanRegistry {
 
         // Check that because not every loan is brand new, there could be loans that have a different time left.
         int delay = loan.getTimeLeft() <= 0 ? ConfigValues.getLoanDelay() : BPUtils.millisecondsInTicks(loan.getTimeLeft());
+        loan.setTimeLeft(System.currentTimeMillis() + BPUtils.ticksInMilliseconds(delay));
         loan.setTask(Bukkit.getScheduler().runTaskLater(BankPlus.INSTANCE(), () -> advanceReturningTask(loan), delay));
     }
 
@@ -190,7 +207,8 @@ public class BPLoanRegistry {
         loan.setInstalmentsPoint(loan.getInstalmentsPoint() + 1);
         int instalments = loan.getInstalments();
 
-        BigDecimal currentTaskAmount = loan.getMoneyToReturn().divide(BigDecimal.valueOf(instalments));
+        // Plain divide() throws on results like 100 / 3, so give it a precision.
+        BigDecimal currentTaskAmount = loan.getMoneyToReturn().divide(BigDecimal.valueOf(Math.max(1, instalments)), MathContext.DECIMAL128);
         OfflinePlayer sender = loan.getSender(), receiver = loan.getReceiver();
         boolean isBankToPlayer = sender == null;
 

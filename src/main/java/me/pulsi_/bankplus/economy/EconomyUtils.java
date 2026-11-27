@@ -4,6 +4,7 @@ import me.pulsi_.bankplus.BankPlus;
 import me.pulsi_.bankplus.account.PlayerRegistry;
 import me.pulsi_.bankplus.managers.BPTaskManager;
 import me.pulsi_.bankplus.sql.BPSQL;
+import me.pulsi_.bankplus.utils.BPLogger;
 import me.pulsi_.bankplus.values.ConfigValues;
 import org.bukkit.Bukkit;
 import org.bukkit.OfflinePlayer;
@@ -21,13 +22,15 @@ public class EconomyUtils {
      * @param p The player.
      */
     public static void savePlayer(OfflinePlayer p, boolean unload) {
+        boolean saved = true;
         for (BPEconomy economy : BPEconomy.list()) {
             // Skip unloaded holders so a failed/partial load cannot overwrite SQL with defaults.
             if (!economy.isPlayerLoaded(p)) continue;
-            BPSQL.savePlayer(p, economy);
+            if (!BPSQL.savePlayer(p, economy)) saved = false;
         }
 
-        if (unload) PlayerRegistry.unloadPlayer(p);
+        // If something failed keep the player loaded, the next saving cycle will try again instead of losing the data.
+        if (unload && saved) PlayerRegistry.unloadPlayer(p);
     }
 
     /**
@@ -58,10 +61,18 @@ public class EconomyUtils {
             return;
         }
 
+        // Only used on shutdown, just log a bit in case saving gets stuck.
+        int total = loadedUUIDs.size(), saved = 0;
+        long start = System.currentTimeMillis();
+        BPLogger.Console.info("Saving " + total + " loaded players...");
         for (UUID uuid : loadedUUIDs) {
             OfflinePlayer p = Bukkit.getOfflinePlayer(uuid);
             savePlayer(p, !p.isOnline());
+
+            saved++;
+            if (saved % 50 == 0) BPLogger.Console.info("Saved " + saved + "/" + total + "...");
         }
+        BPLogger.Console.info("Saved everyone in " + (System.currentTimeMillis() - start) + "ms.");
     }
 
     /**

@@ -4,17 +4,19 @@ import me.pulsi_.bankplus.BankPlus;
 import me.pulsi_.bankplus.bankSystem.Bank;
 import me.pulsi_.bankplus.bankSystem.BankRegistry;
 import me.pulsi_.bankplus.economy.BPEconomy;
+import me.pulsi_.bankplus.sql.BPSQL;
 import me.pulsi_.bankplus.utils.BPLogger;
 import org.bukkit.Bukkit;
 import org.bukkit.OfflinePlayer;
 import org.bukkit.entity.Player;
 
-import java.util.HashMap;
+import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 
 public class PlayerRegistry {
 
-    private static final HashMap<UUID, BPPlayer> players = new HashMap<>();
+    private static final Map<UUID, BPPlayer> players = new ConcurrentHashMap<>();
 
     public static boolean isPlayerLoaded(OfflinePlayer p) {
         return players.containsKey(p.getUniqueId());
@@ -66,7 +68,14 @@ public class PlayerRegistry {
             return bpPlayer;
         }
 
-        Bukkit.getScheduler().runTaskAsynchronously(BankPlus.INSTANCE(), () -> bank.getBankEconomy().loadPlayer(p, wasRegistered));
+        if (BankPlus.INSTANCE().isEnabled())
+            Bukkit.getScheduler().runTaskAsynchronously(BankPlus.INSTANCE(), () -> {
+                try {
+                    bank.getBankEconomy().loadPlayer(p, wasRegistered);
+                } catch (BPSQL.DataException e) {
+                    BPLogger.Console.error(e, "Could not load " + p.getName() + " in the bank " + bank.getIdentifier() + ", the bank will be unavailable for them.");
+                }
+            });
         players.putIfAbsent(uuid, bpPlayer);
         return bpPlayer;
     }

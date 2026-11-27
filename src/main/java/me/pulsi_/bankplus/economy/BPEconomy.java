@@ -10,6 +10,7 @@ import me.pulsi_.bankplus.events.BPAfterTransactionEvent;
 import me.pulsi_.bankplus.events.BPPreTransactionEvent;
 import me.pulsi_.bankplus.listeners.playerChat.PlayerChatMethod;
 import me.pulsi_.bankplus.sql.BPSQL;
+import me.pulsi_.bankplus.utils.BPLogger;
 import me.pulsi_.bankplus.utils.BPUtils;
 import me.pulsi_.bankplus.utils.texts.BPMessages;
 import me.pulsi_.bankplus.values.ConfigValues;
@@ -23,12 +24,14 @@ import org.bukkit.entity.Player;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
 public class BPEconomy {
 
     private final Bank originBank;
-    private final HashMap<UUID, Holder> holders = new HashMap<>();
-    private final Set<UUID> operations = new HashSet<>();
+    // Both are touched from async tasks (interest, joins, saving) and from the main thread.
+    private final Map<UUID, Holder> holders = new ConcurrentHashMap<>();
+    private final Set<UUID> operations = ConcurrentHashMap.newKeySet();
 
     // Not used anymore after the SQL saving rewrite. Keep for now, delete later if still unused.
     // private final String moneyPath, interestPath, debtPath, levelPath;
@@ -84,7 +87,15 @@ public class BPEconomy {
      */
     public static LinkedHashMap<String, BigDecimal> getAllEconomiesBankBalances() {
         LinkedHashMap<String, BigDecimal> balances = new LinkedHashMap<>();
-        for (OfflinePlayer p : Bukkit.getOfflinePlayers()) balances.put(p.getName(), getBankBalancesSum(p));
+        for (OfflinePlayer p : Bukkit.getOfflinePlayers()) {
+            if (!BankPlus.INSTANCE().isEnabled()) break;
+
+            try {
+                balances.put(p.getName(), getBankBalancesSum(p));
+            } catch (BPSQL.DataException e) {
+                BPLogger.Console.warn(e, "Skipping " + p.getName() + " in the bank top.");
+            }
+        }
         return balances;
     }
 
@@ -164,8 +175,8 @@ public class BPEconomy {
         String bankName = originBank.getIdentifier();
 
         holder.bankLevel = BPSQL.getBankLevel(p, bankName);
-        holder.debt = BPSQL.getDebt(p, bankName);
-        holder.money = useStartAmount ? ConfigValues.getStartAmount() : BPSQL.getMoney(p, bankName);
+        holder.setDebt(BPSQL.getDebt(p, bankName));
+        holder.setMoney(useStartAmount ? ConfigValues.getStartAmount() : BPSQL.getMoney(p, bankName));
 
         return holder;
     }
@@ -197,8 +208,10 @@ public class BPEconomy {
      */
     public Holder loadPlayer(OfflinePlayer p, boolean wasRegistered) {
         Holder holder = getHolder(p, wasRegistered);
-        holders.putIfAbsent(p.getUniqueId(), holder);
-        return holder;
+
+        // If another thread loaded it in the meantime, keep that one so everybody works on the same instance.
+        Holder existing = holders.putIfAbsent(p.getUniqueId(), holder);
+        return existing != null ? existing : holder;
     }
 
     /**
@@ -274,21 +287,26 @@ public class BPEconomy {
         BigDecimal result = BigDecimal.ZERO;
         if (!startAndCheckOperationAllowed(p)) return result;
 
-        if (!ignoreEvents) {
-            BPPreTransactionEvent event = preTransactionEvent(p, type, amount);
-            if (event.isCancelled()) {
-                endOperation(p);
-                return result;
+        try {
+            if (!ignoreEvents) {
+                BPPreTransactionEvent event = preTransactionEvent(p, type, amount);
+                if (event.isCancelled()) {
+                    endOperation(p);
+                    return result;
+                }
+
+                amount = event.getTransactionAmount();
             }
 
-            amount = event.getTransactionAmount();
+            BigDecimal capacity = BankUtils.getCapacity(originBank, p);
+            if (capacity.compareTo(BigDecimal.ZERO) > 0) amount = amount.min(capacity);
+
+            result = result.max(amount);
+            setMoney(p, result);
+        } catch (RuntimeException e) {
+            endOperation(p);
+            throw e;
         }
-
-        BigDecimal capacity = BankUtils.getCapacity(originBank, p);
-        if (capacity.compareTo(BigDecimal.ZERO) > 0) amount = amount.min(capacity);
-
-        result = result.max(amount);
-        setMoney(p, result);
 
         if (!ignoreEvents) afterTransactionEvent(p, type, result);
         return result;
@@ -341,28 +359,33 @@ public class BPEconomy {
         BigDecimal result = BigDecimal.ZERO;
         if (!startAndCheckOperationAllowed(p)) return result;
 
-        if (!ignoreEvents) {
-            BPPreTransactionEvent event = preTransactionEvent(p, type, amount);
-            if (event.isCancelled()) {
-                endOperation(p);
-                return result;
+        try {
+            if (!ignoreEvents) {
+                BPPreTransactionEvent event = preTransactionEvent(p, type, amount);
+                if (event.isCancelled()) {
+                    endOperation(p);
+                    return result;
+                }
+
+                amount = event.getTransactionAmount();
             }
 
-            amount = event.getTransactionAmount();
-        }
-
-        BigDecimal capacity = BankUtils.getCapacity(originBank, p), balance = getBankBalance(p);
-        if (capacity.compareTo(BigDecimal.ZERO) <= 0) {
-            result = amount;
-            setMoney(p, balance.add(result));
-        } else {
-            if (balance.add(amount).compareTo(capacity) < 0) {
+            BigDecimal capacity = BankUtils.getCapacity(originBank, p), balance = getBankBalance(p);
+            if (capacity.compareTo(BigDecimal.ZERO) <= 0) {
                 result = amount;
                 setMoney(p, balance.add(result));
             } else {
-                result = capacity.subtract(balance).max(BigDecimal.ZERO);
-                setMoney(p, capacity);
+                if (balance.add(amount).compareTo(capacity) < 0) {
+                    result = amount;
+                    setMoney(p, balance.add(result));
+                } else {
+                    result = capacity.subtract(balance).max(BigDecimal.ZERO);
+                    setMoney(p, capacity);
+                }
             }
+        } catch (RuntimeException e) {
+            endOperation(p);
+            throw e;
         }
 
         if (!ignoreEvents) afterTransactionEvent(p, type, result);
@@ -416,21 +439,26 @@ public class BPEconomy {
         BigDecimal result = BigDecimal.ZERO;
         if (!startAndCheckOperationAllowed(p)) return result;
 
-        if (!ignoreEvents) {
-            BPPreTransactionEvent event = preTransactionEvent(p, type, amount);
-            if (event.isCancelled()) {
-                endOperation(p);
-                return result;
+        try {
+            if (!ignoreEvents) {
+                BPPreTransactionEvent event = preTransactionEvent(p, type, amount);
+                if (event.isCancelled()) {
+                    endOperation(p);
+                    return result;
+                }
+
+                amount = event.getTransactionAmount();
             }
 
-            amount = event.getTransactionAmount();
+            BigDecimal balance = getBankBalance(p);
+            if (balance.subtract(amount).compareTo(BigDecimal.ZERO) < 0) result = balance;
+            else result = amount;
+
+            setMoney(p, balance.subtract(result));
+        } catch (RuntimeException e) {
+            endOperation(p);
+            throw e;
         }
-
-        BigDecimal balance = getBankBalance(p);
-        if (balance.subtract(amount).compareTo(BigDecimal.ZERO) < 0) result = balance;
-        else result = amount;
-
-        setMoney(p, balance.subtract(result));
 
         if (!ignoreEvents) afterTransactionEvent(p, type, result);
         return result;
@@ -442,6 +470,9 @@ public class BPEconomy {
      * @param p The player.
      */
     public BigDecimal getDebt(OfflinePlayer p) {
+        // Same as the balance: an online player still loading has nothing to read yet.
+        if (p.isOnline() && !isPlayerLoaded(p)) return BigDecimal.ZERO;
+
         return getHolder(p).debt;
     }
 
@@ -453,8 +484,12 @@ public class BPEconomy {
      */
     public void setDebt(OfflinePlayer p, BigDecimal amount) {
         if (!startAndCheckOperationAllowed(p)) return;
-        loadPlayer(p).setDebt(amount);
-        endOperation(p);
+
+        try {
+            loadPlayer(p).setDebt(amount);
+        } finally {
+            endOperation(p);
+        }
     }
 
     /**
@@ -464,6 +499,8 @@ public class BPEconomy {
      * @return The current bank level.
      */
     public int getBankLevel(OfflinePlayer p) {
+        if (p.isOnline() && !isPlayerLoaded(p)) return 1;
+
         return getHolder(p).bankLevel;
     }
 
@@ -475,8 +512,12 @@ public class BPEconomy {
      */
     public void setBankLevel(OfflinePlayer p, int level) {
         if (!startAndCheckOperationAllowed(p)) return;
-        loadPlayer(p).setBankLevel(level);
-        endOperation(p);
+
+        try {
+            loadPlayer(p).setBankLevel(level);
+        } finally {
+            endOperation(p);
+        }
     }
 
     /**
@@ -532,10 +573,15 @@ public class BPEconomy {
 
         BigDecimal actualDepositingMoney = finalAmount.subtract(taxes);
 
-        EconomyResponse depositResponse = economy.withdrawPlayer(p, finalAmount.doubleValue());
-        if (BPUtils.hasFailed(p, depositResponse)) return;
+        // Bank first: if the bank denies the operation nothing has been taken from the wallet yet.
+        BigDecimal added = addBankBalance(p, actualDepositingMoney, true);
+        if (added.compareTo(BigDecimal.ZERO) <= 0 && actualDepositingMoney.compareTo(BigDecimal.ZERO) > 0) return;
 
-        addBankBalance(p, actualDepositingMoney, true);
+        EconomyResponse depositResponse = economy.withdrawPlayer(p, finalAmount.doubleValue());
+        if (BPUtils.hasFailed(p, depositResponse)) {
+            removeBankBalance(p, added, true);
+            return;
+        }
 
         List<String> replacers = BPUtils.placeValues(p, actualDepositingMoney);
         replacers.addAll(BPUtils.placeValues(taxes, "taxes"));
@@ -568,6 +614,11 @@ public class BPEconomy {
         if (maxWithdraw.compareTo(BigDecimal.ZERO) > 0 && amount.compareTo(maxWithdraw) >= 0) amount = maxWithdraw;
         if (bankBal.compareTo(amount) < 0) amount = bankBal;
 
+        // Bank first: if the bank denies the operation the wallet hasn't been paid yet.
+        BigDecimal removed = removeBankBalance(p, amount, true);
+        if (removed.compareTo(BigDecimal.ZERO) <= 0 && amount.compareTo(BigDecimal.ZERO) > 0) return;
+        amount = removed;
+
         BigDecimal withdrawTaxes = ConfigValues.getWithdrawTaxes(), taxes = BigDecimal.ZERO;
         if (withdrawTaxes.compareTo(BigDecimal.ZERO) > 0 && !p.hasPermission("bankplus.withdraw.bypass-taxes")) {
             taxes = amount.multiply(withdrawTaxes).divide(BigDecimal.valueOf(100), RoundingMode.DOWN);
@@ -575,9 +626,10 @@ public class BPEconomy {
         }
 
         EconomyResponse withdrawResponse = BankPlus.INSTANCE().getVaultEconomy().depositPlayer(p, amount.subtract(taxes).doubleValue());
-        if (BPUtils.hasFailed(p, withdrawResponse)) return;
-
-        removeBankBalance(p, amount, true);
+        if (BPUtils.hasFailed(p, withdrawResponse)) {
+            addBankBalance(p, amount, true);
+            return;
+        }
 
         List<String> replacers = BPUtils.placeValues(p, amount.subtract(taxes));
         replacers.addAll(BPUtils.placeValues(taxes, "taxes"));
@@ -594,7 +646,7 @@ public class BPEconomy {
      * @param p The player.
      */
     public void customDeposit(Player p) {
-        if (MessageValues.isTitleCustomAmountEnabled()) BPUtils.sendTitle(MessageValues.getCustomDepositTitle(), p);
+        if (MessageValues.isTitleCustomAmountEnabled()) BPUtils.sendTitle(MessageValues.getCustomDepositTitle(), p, ConfigValues.getChatExitTime() * 20);
 
         BPMessages.sendIdentifier(p, "Chat-Deposit");
         p.closeInventory();
@@ -616,7 +668,7 @@ public class BPEconomy {
      * @param p The player.
      */
     public void customWithdraw(Player p) {
-        if (MessageValues.isTitleCustomAmountEnabled()) BPUtils.sendTitle(MessageValues.getCustomWithdrawTitle(), p);
+        if (MessageValues.isTitleCustomAmountEnabled()) BPUtils.sendTitle(MessageValues.getCustomWithdrawTitle(), p, ConfigValues.getChatExitTime() * 20);
 
         BPMessages.sendIdentifier(p, "Chat-Withdraw");
         p.closeInventory();
@@ -641,8 +693,8 @@ public class BPEconomy {
      * @param toBank The bank where the money will be added.
      */
     public void pay(Player from, Player to, BigDecimal amount, Bank toBank) {
-        if (!startAndCheckOperationAllowed(from) || !startAndCheckOperationAllowed(to)) return;
-
+        // No operation is started here: the add and remove methods below start their own, and starting
+        // it twice made them deny the transaction, leaving both players blocked on the early returns.
         BigDecimal senderBalance = getBankBalance(from);
         // Check if the sender has at least more than 0 money
         if (senderBalance.compareTo(amount) < 0) {
@@ -657,11 +709,21 @@ public class BPEconomy {
             return;
         }
 
-        BigDecimal added = toEconomy.addBankBalance(to, amount, TransactionType.PAY), extra = amount.subtract(added);
-        BPMessages.sendIdentifier(to, "Payment-Received", BPUtils.placeValues(from, added));
+        // Take the money first, so a denied operation can never create money out of thin air.
+        BigDecimal removed = removeBankBalance(from, amount, TransactionType.PAY);
+        if (removed.compareTo(BigDecimal.ZERO) <= 0) return;
 
-        BigDecimal removed = removeBankBalance(from, amount.subtract(extra), TransactionType.PAY);
-        BPMessages.sendIdentifier(from, "Payment-Sent", BPUtils.placeValues(to, removed));
+        BigDecimal added = toEconomy.addBankBalance(to, removed, TransactionType.PAY), extra = removed.subtract(added);
+
+        // Give back what the receiver bank couldn't take.
+        if (extra.compareTo(BigDecimal.ZERO) > 0) addBankBalance(from, extra, true);
+        if (added.compareTo(BigDecimal.ZERO) <= 0) {
+            BPMessages.sendIdentifier(from, "Bank-Full", "%player%$" + to.getName());
+            return;
+        }
+
+        BPMessages.sendIdentifier(to, "Payment-Received", BPUtils.placeValues(from, added));
+        BPMessages.sendIdentifier(from, "Payment-Sent", BPUtils.placeValues(to, added));
     }
 
     private boolean minimumAmount(Player p, BigDecimal amount, BigDecimal minimum) {
@@ -700,10 +762,10 @@ public class BPEconomy {
      * @return true if the transaction is allowed, false otherwise.
      */
     private boolean startAndCheckOperationAllowed(OfflinePlayer p) {
-        if ((p.isOnline() && !isPlayerLoaded(p)) || operations.contains(p.getUniqueId())) return false;
+        if (p.isOnline() && !isPlayerLoaded(p)) return false;
 
-        operations.add(p.getUniqueId());
-        return true;
+        // Add returns false if the player already had an operation running, checking and adding in one step.
+        return operations.add(p.getUniqueId());
     }
 
     /**
@@ -717,15 +779,24 @@ public class BPEconomy {
 
     private static class Holder {
 
+        // Hard ceiling (10^100) so a runaway balance can never outgrow the storage columns, even with unlimited capacity.
+        private static final BigDecimal MAX_AMOUNT = BigDecimal.TEN.pow(100);
+
         private BigDecimal money = BigDecimal.ZERO, debt = BigDecimal.ZERO;
         private int bankLevel = 1;
 
         public void setMoney(BigDecimal money) {
-            this.money = money.max(BigDecimal.ZERO);
+            this.money = normalize(money);
         }
 
         public void setDebt(BigDecimal debt) {
-            this.debt = debt.max(BigDecimal.ZERO);
+            this.debt = normalize(debt);
+        }
+
+        // Interest multiplies the scale of the balance on every round, so without rounding it the stored
+        // text keeps growing until it doesn't fit the column anymore.
+        private static BigDecimal normalize(BigDecimal amount) {
+            return amount.max(BigDecimal.ZERO).min(MAX_AMOUNT).setScale(Math.max(0, ConfigValues.getMaxDecimalsAmount()), RoundingMode.DOWN);
         }
 
         public void setBankLevel(int bankLevel) {
